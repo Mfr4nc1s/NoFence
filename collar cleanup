@@ -1,0 +1,390 @@
+```{r}
+# ===================================================================
+# Collar Data Cleanup + Timezone + Cow ID Merge + Phase Access
+# Author: Matthew Francis
+# Description:
+#   - Cleans collar data
+#   - Converts timestamps to UTC & MDT
+#   - Adds Date, Hour, and Date_Hour
+#   - Merges Cow ID data by Serial
+#   - Classifies each record into Phase 1 (no access) or Phase 2 (deferred access)
+# ===================================================================
+
+# ------------------------------
+# Load required packages
+# ------------------------------
+library(tidyverse)
+library(lubridate)
+library(readxl)
+
+# ------------------------------
+# Set working directory
+# ------------------------------
+setwd("C:/Users/Supriya Monajigari/Documents")
+
+# ------------------------------
+# 1. Import collar and cow ID data
+# ------------------------------
+collar_dat <- read_csv("Book2_combined.csv")
+cowid_df   <- read_excel("cowid.xlsx")  # must contain Serial + Cow_ID
+
+# ------------------------------
+# 2. Remove duplicate rows
+# ------------------------------
+collar_dat <- collar_dat %>% distinct()
+
+# ------------------------------
+# 3. Convert timestamps to UTC
+# ------------------------------
+if ("Time" %in% names(collar_dat)) {
+  collar_dat$Time.UTC <- as.POSIXct(
+    collar_dat$Time,
+    tz = "UTC",
+    format = "%Y-%m-%dT%H:%M:%OS"
+  )
+}
+
+if ("Position.Time" %in% names(collar_dat)) {
+  collar_dat$Position.Time.UTC <- as.POSIXct(
+    collar_dat$Position.Time,
+    tz = "UTC",
+    format = "%Y-%m-%d %H:%M:%OS"
+  )
+}
+
+# ------------------------------
+# 4. Convert to Mountain Daylight Time (MDT)
+# ------------------------------
+if ("Time.UTC" %in% names(collar_dat)) {
+  collar_dat$Time.Mountain <- with_tz(collar_dat$Time.UTC, "Etc/GMT+6")
+}
+
+if ("Position.Time.UTC" %in% names(collar_dat)) {
+  collar_dat$Position.Time.MDT <- with_tz(collar_dat$Position.Time.UTC, "Etc/GMT+6")
+}
+
+# ------------------------------
+# 5. Create Date, Hour, and Date_Hour columns
+# ------------------------------
+if ("Time.Mountain" %in% names(collar_dat)) {
+  collar_dat$Date <- as.Date(collar_dat$Time.Mountain, tz = "Etc/GMT+6")
+  collar_dat$Hour <- hour(collar_dat$Time.Mountain)
+  collar_dat$Date_Hour <- paste(collar_dat$Date, collar_dat$Hour, sep = "_")
+}
+
+# ------------------------------
+# 6. Merge Cow ID info (by Serial)
+# ------------------------------
+if ("Serial" %in% names(collar_dat) & "Serial" %in% names(cowid_df)) {
+  collar_merged <- left_join(collar_dat, cowid_df, by = "Serial")
+} else {
+  warning("Column 'Serial' not found in one or both datasets — skipping merge.")
+  collar_merged <- collar_dat
+}
+
+# ------------------------------
+# 7. Assign Phase and Access Status
+# ------------------------------
+collar_merged <- collar_merged %>%
+  mutate(
+    Phase = case_when(
+      Date >= as.Date("2024-07-01") & Date <= as.Date("2024-08-03") ~ "Phase 1",
+      Date >= as.Date("2024-08-04") & Date <= as.Date("2024-09-03") ~ "Phase 2",
+      TRUE ~ "Outside Phases"
+    ),
+    Access_Status = case_when(
+      Phase == "Phase 1" ~ "No access to deferred areas",
+      Phase == "Phase 2" ~ "Access to deferred areas",
+      TRUE ~ "N/A"
+    )
+  )
+
+# ------------------------------
+# 8. Order by date/time
+# ------------------------------
+if ("Time.Mountain" %in% names(collar_merged)) {
+  collar_merged <- collar_merged[order(collar_merged$Time.Mountain), ]
+}
+
+# ------------------------------
+# 9. Save cleaned + phase-labeled dataset
+# ------------------------------
+write_csv(collar_merged, "collars_clean_phases.csv")
+
+# ------------------------------
+# 10. Print summary
+# ------------------------------
+cat("Rows in final dataset:", nrow(collar_merged), "\n")
+cat("Columns in final dataset:", ncol(collar_merged), "\n")
+cat("File saved as 'collars_clean_phases.csv' in Documents.\n")
+
+
+# ===================================================================
+
+```
+
+
+
+
+```{r}
+# ===================================================================
+# Collar Report & GPS Interval Calculation
+# Author: Matthew Francis
+# Description:
+#   - Uses cleaned collar-phase dataset
+#   - Calculates time between collar reports & GPS fixes
+#   - Saves updated dataset with new interval columns
+# ===================================================================
+
+# ------------------------------
+# Load packages
+# ------------------------------
+library(tidyverse)
+library(lubridate)
+
+# ------------------------------
+# Set working directory
+# ------------------------------
+setwd("C:/Users/Supriya Monajigari/Documents")
+
+# ------------------------------
+# 1. Read dataset
+# ------------------------------
+collar_df <- read_csv("collars_clean_phases.csv")
+
+# ------------------------------
+# 2. Convert timestamps properly
+# ------------------------------
+# Ensure main collar time is in POSIXct (MDT)
+collar_df$Time.Mountain <- as.POSIXct(
+  collar_df$Time.Mountain,
+  tz = "Etc/GMT+6",
+  format = "%Y-%m-%d %H:%M:%OS"
+)
+
+# Create MDT version of GPS timestamp
+collar_df$Position.Time.MDT <- as.POSIXct(
+  collar_df$`Position Time`,
+  tz = "Etc/GMT+6",
+  format = "%Y-%m-%d %H:%M:%OS"
+)
+
+# Ensure Date is Date object
+collar_df$Date <- as.Date(collar_df$Date, tz = "Etc/GMT+6")
+
+# ------------------------------
+# 3. Split data by Serial (each collar)
+# ------------------------------
+split_df <- split(collar_df, collar_df$Serial)
+
+# Empty holders
+report_intervals_all <- data.frame()
+gps_intervals_all <- data.frame()
+
+# ------------------------------
+# 4. Loop through each collar to calculate intervals
+# ------------------------------
+for (i in seq_along(split_df)) {
+  
+  collars_temp <- split_df[[i]]
+  collars_temp <- collars_temp[order(collars_temp$Time.Mountain), ]
+  
+  # ---- Collar report interval ----
+  collars_temp_report <- collars_temp %>%
+    filter(!is.na(Time.Mountain)) %>%
+    mutate(Report.Interval.Sec = as.numeric(Time.Mountain - lag(Time.Mountain, default = first(Time.Mountain))))
+  
+  # ---- GPS fix interval ----
+  collars_temp_gps <- collars_temp %>%
+    filter(!is.na(Position.Time.MDT)) %>%
+    distinct(Position.Time.MDT, .keep_all = TRUE) %>%
+    mutate(GPS.Interval.Sec = as.numeric(Position.Time.MDT - lag(Position.Time.MDT, default = first(Position.Time.MDT))))
+  
+  # Combine
+  report_intervals_all <- bind_rows(report_intervals_all, collars_temp_report)
+  gps_intervals_all <- bind_rows(gps_intervals_all, collars_temp_gps)
+  
+  gc() # cleanup memory
+}
+
+# ------------------------------
+# 5. Merge interval data back into main dataset
+# ------------------------------
+collar_intervals <- collar_df %>%
+  left_join(select(gps_intervals_all, Serial, Position.Time.MDT, GPS.Interval.Sec),
+            by = c("Serial", "Position.Time.MDT")) %>%
+  left_join(select(report_intervals_all, Serial, Time.Mountain, Report.Interval.Sec),
+            by = c("Serial", "Time.Mountain"))
+
+# ------------------------------
+# 6. Save final dataset
+# ------------------------------
+write_csv(collar_intervals, "collars_with_intervals.csv")
+
+# ------------------------------
+# 7. Print summary
+# ------------------------------
+cat("✅ Intervals calculated and saved as 'collars_with_intervals.csv'\n")
+cat("Rows:", nrow(collar_intervals), " | Columns:", ncol(collar_intervals), "\n")
+
+
+# ===================================================================
+
+```
+
+```{r}
+# ===================================================================
+# 8 (Fixed): Merge Report + GPS Interval Data into Main Dataset
+# Author: Matthew Francis
+# Description:
+#   - Merges interval data (report + GPS) with main collar dataset
+#   - Automatically detects correct timestamp column names
+# ===================================================================
+
+# ------------------------------
+# Load packages
+# ------------------------------
+library(tidyverse)
+
+# ------------------------------
+# Set working directory
+# ------------------------------
+setwd("C:/Users/Supriya Monajigari/Documents")
+
+# ------------------------------
+# 1. Load main cleaned dataset
+# ------------------------------
+collar_df <- read_csv("collars_clean_phases.csv")
+
+# Use the in-memory dataframes created earlier:
+gps_interval_blank <- gps_intervals_all
+report_interval_blank <- report_intervals_all
+
+# ------------------------------
+# 2. Standardize column names
+# ------------------------------
+names(collar_df) <- gsub(" ", ".", names(collar_df))
+names(gps_interval_blank) <- gsub(" ", ".", names(gps_interval_blank))
+names(report_interval_blank) <- gsub(" ", ".", names(report_interval_blank))
+
+# Check which timestamp columns exist
+print(names(collar_df))
+
+# If your collar dataset has "Position.Time" instead of "Position.Time.MDT",
+# create the correct column name for joining
+if (!"Position.Time.MDT" %in% names(collar_df) && "Position.Time" %in% names(collar_df)) {
+  collar_df <- collar_df %>%
+    rename(Position.Time.MDT = Position.Time)
+}
+
+# ------------------------------
+# 3. Merge GPS and report intervals into main dataset
+# ------------------------------
+collar_intervals <- collar_df %>%
+  left_join(
+    select(
+      gps_interval_blank,
+      Serial, Time.Mountain, Position.Time.MDT, GPS.Interval.Sec
+    ),
+    by = c("Serial", "Time.Mountain", "Position.Time.MDT")
+  ) %>%
+  left_join(
+    select(
+      report_interval_blank,
+      Serial, Time.Mountain, Report.Interval.Sec
+    ),
+    by = c("Serial", "Time.Mountain")
+  )
+
+# ------------------------------
+# 4. Save final merged dataset
+# ------------------------------
+write_csv(collar_intervals, "collars_with_all_intervals.csv")
+
+# ------------------------------
+# 5. Print summary
+# ------------------------------
+cat("✅ Intervals successfully merged into main dataset!\n")
+cat("Rows:", nrow(collar_intervals), " | Columns:", ncol(collar_intervals), "\n")
+cat("File saved as 'collars_with_all_intervals.csv' in Documents.\n")
+
+# ===================================================================
+# End of Script
+# ===================================================================
+
+
+```
+
+```{r}
+# ===================================================================
+# Final Collar Data Cleanup
+# Author: Matthew Francis
+# Description:
+#   - Cleans collar dataset after all merges and interval calculations
+#   - Removes technical columns only if they exist
+#   - Creates master and working datasets for analysis
+# ===================================================================
+
+library(tidyverse)
+library(lubridate)
+
+# ------------------------------
+# Set working directory
+# ------------------------------
+setwd("C:/Users/Supriya Monajigari/Documents")
+
+# ------------------------------
+# 1. Read the main dataset (with intervals)
+# ------------------------------
+collar_all <- read_csv("collars_with_all_intervals.csv")
+
+# ------------------------------
+# 2. Drop unnecessary technical columns (ignore if missing)
+# ------------------------------
+drop_cols <- c(
+  "Time",
+  "Position Time",
+  "Humidity", "Pressure",
+  "GSM RAT", "GSM Operator", "Min RSSI", "Max RSSI",
+  "Horizontal Accuracy", "HDOP", "#Satellites",
+  "Battery Voltage", "Solar Charge", "Temperature",
+  "Pasture ID", "Pasture Version", "Collar Version", "Source_Sheet"
+)
+
+clean_collar_dat <- collar_all %>%
+  select(-any_of(drop_cols))
+
+# ------------------------------
+# 3. Create working dataset for analysis
+# ------------------------------
+keep_cols <- c(
+  "Serial", "Cow_id", "Latitude", "Longitude",
+  "Time.Mountain", "Date", "Hour", "Phase", "Access_Status",
+  "Activity", "Mode", "Fence Status", "Collar Status",
+  "GPS.Interval.Sec", "Report.Interval.Sec"
+)
+
+working_collar_dat <- clean_collar_dat %>%
+  select(any_of(keep_cols))
+
+# ------------------------------
+# 4. Write cleaned datasets to CSV
+# ------------------------------
+write_csv(clean_collar_dat, "collars_clean_master.csv")
+write_csv(working_collar_dat, "collars_working_dataset.csv")
+
+# ------------------------------
+# 5. Summary
+# ------------------------------
+cat("✅ Cleaned datasets written to Documents folder.\n")
+cat("Files created:\n")
+cat(" - collars_clean_master.csv\n")
+cat(" - collars_working_dataset.csv\n")
+cat("Rows in working dataset:", nrow(working_collar_dat), "\n")
+cat("Columns in working dataset:", ncol(working_collar_dat), "\n")
+
+
+# ===================================================================
+
+```
+
