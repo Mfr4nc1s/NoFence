@@ -1,0 +1,71 @@
+```{r}
+# =========================================================
+#   BUFFER EACH POLYGON ±5 m AND SAVE NEW GEOPACKAGES
+# =========================================================
+
+library(sf)
+library(units)
+
+# ---------- CONFIG ----------
+WORK_DIR  <- "C:/Users/Supriya Monajigari/Documents"
+PLOTS_DIR <- file.path(WORK_DIR, "Plot geopacks")                 # <-- your actual folder
+OUT_DIR   <- file.path(WORK_DIR, "plot geopacks buffered")        # <-- output folder
+
+# Create output folder if it doesn’t exist
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+# CRS used for buffering (UTM Zone 12N — metric)
+CRS_METRIC <- 32612
+
+# ---------- FIND AND PROCESS GPKG FILES ----------
+plot_files <- list.files(PLOTS_DIR, pattern = "\\.gpkg$", full.names = TRUE)
+if (length(plot_files) == 0) stop("❌ No GeoPackage files found in ", PLOTS_DIR)
+
+for (f in plot_files) {
+  plot_name <- tools::file_path_sans_ext(basename(f))
+  message("\n▶️ Processing ", plot_name)
+
+  # --- Read polygon ---
+  plot_sf <- tryCatch(st_read(f, quiet = TRUE), error = function(e) NULL)
+  if (is.null(plot_sf)) {
+    message("⚠️ Skipping ", plot_name, " (failed to read)")
+    next
+  }
+
+  # --- Validate + set CRS ---
+  plot_sf <- st_make_valid(plot_sf)
+  if (is.na(st_crs(plot_sf))) st_crs(plot_sf) <- 4326
+  plot_sf <- st_transform(plot_sf, CRS_METRIC)
+
+  # --- Create buffers ---
+  plus5  <- st_make_valid(st_buffer(plot_sf,  dist =  5))  # 5 m larger
+  minus5 <- st_make_valid(st_buffer(plot_sf,  dist = -5))  # 5 m smaller
+  true   <- plot_sf                                         # unmodified
+
+  # --- Reproject back to WGS84 for QGIS ---
+  plus5_wgs  <- st_transform(plus5,  4326)
+  minus5_wgs <- st_transform(minus5, 4326)
+  true_wgs   <- st_transform(true,   4326)
+
+  # --- Prepare output GeoPackage ---
+  out_gpkg <- file.path(OUT_DIR, paste0(plot_name, "_buffered.gpkg"))
+  if (file.exists(out_gpkg)) file.remove(out_gpkg)
+
+  # --- Write 3 layers ---
+  st_write(true_wgs,   out_gpkg, paste0(plot_name, "_true"),  quiet = TRUE)
+  st_write(plus5_wgs,  out_gpkg, paste0(plot_name, "_plus5"), quiet = TRUE)
+  st_write(minus5_wgs, out_gpkg, paste0(plot_name, "_minus5"), quiet = TRUE)
+
+  # --- Area feedback ---
+  a_true  <- as.numeric(set_units(st_area(true),  ha))
+  a_plus  <- as.numeric(set_units(st_area(plus5), ha))
+  a_minus <- as.numeric(set_units(st_area(minus5),ha))
+  message("   Area (ha): true=", round(a_true,2),
+          "  +5m=", round(a_plus,2),
+          "  -5m=", round(a_minus,2))
+}
+
+message("\n✅ Done. Buffered GeoPackages saved to:\n", OUT_DIR)
+
+```
+

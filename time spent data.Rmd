@@ -1,0 +1,166 @@
+```{r}
+# --- Load required packages ----
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(purrr)
+library(stringr)
+
+# --- 0. Load collar data from file if not already in memory ----
+library(readr)
+library(readxl)
+
+if (!exists("clean_collar_dat")) {
+  message("🔍 Loading collar data from 'collars_clean_master.csv'...")
+  collar_path <- file.path(WORK_DIR, "collars_clean_master.csv")
+
+  if (file.exists(collar_path)) {
+    clean_collar_dat <- read_csv(collar_path)
+    message("✅ Loaded: collars_clean_master.csv")
+  } else {
+    stop("❌ Could not find 'collars_clean_master.csv' in your WORK_DIR.")
+  }
+}
+
+# --- 1. Clean collar data (remove missing coordinates) ----
+clean_collar_dat <- clean_collar_dat %>%
+  filter(!is.na(Longitude), !is.na(Latitude))
+
+# --- 2. Convert collars to sf ----
+collars_sf <- st_as_sf(
+  clean_collar_dat,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326
+)
+message("✅ collars_sf created successfully")
+
+# --- 3. Load and combine all geopackage plots ----
+plot_dir <- file.path(WORK_DIR, "Plot geopacks")
+plot_files <- list.files(plot_dir, pattern = "\\.gpkg$", full.names = TRUE)
+
+plots <- map_dfr(plot_files, function(f) {
+  p <- st_read(f, quiet = TRUE)
+  p$Source_File <- basename(f)
+  p
+})
+
+# --- 4. Extract treatment from filename ----
+plots <- plots %>%
+  mutate(
+    Treatment_Code = str_sub(Source_File, -6, -6),
+    Treatment = case_when(
+      Treatment_Code == "C" ~ "Continuous",
+      Treatment_Code == "D" ~ "Deferred",
+      Treatment_Code == "E" ~ "Exclosed",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# --- 5. Diagnostic: check coordinate ranges ----
+message("🔍 Checking coordinate ranges...")
+print("Collars bounding box:")
+print(st_bbox(collars_sf))
+print("Plots bounding box:")
+print(st_bbox(plots))
+
+# --- 6. Auto-fix mislabeled UTM plots ----
+if (st_bbox(plots)$xmin > 1000) {
+  message("⚠️  Plot coordinates appear to be in UTM metres — correcting CRS to EPSG:26911.")
+  plots <- st_set_crs(plots, 26911)   # NAD83 / UTM Zone 11N
+  plots <- st_transform(plots, 4326)  # convert to lat/long (WGS84)
+}
+
+# --- 7. Visual sanity check (optional) ----
+plot(st_geometry(plots), border = "grey")
+plot(st_geometry(collars_sf), col = "red", pch = 20, add = TRUE)
+
+# --- 8. Align CRS (in case anything still differs) ----
+if (st_crs(plots) != st_crs(collars_sf)) {
+  plots <- st_transform(plots, st_crs(collars_sf))
+}
+
+# --- 9. Spatial join ----
+collars_joined <- st_join(collars_sf, plots, join = st_within)
+message(paste("✅ Spatial join complete. Rows matched:", nrow(collars_joined)))
+
+# --- 10. Calculate time between consecutive fixes ----
+collars_joined <- collars_joined %>%
+  arrange(Cow_id, Time.Mountain) %>%
+  mutate(Time.Mountain = ymd_hms(Time.Mountain)) %>%
+  group_by(Cow_id) %>%
+  mutate(TimeSpent_min = as.numeric(difftime(lead(Time.Mountain), Time.Mountain, units = "mins"))) %>%
+  ungroup()
+
+# --- 11. Keep only rows where cow stayed in same plot ----
+collars_joined <- collars_joined %>%
+  mutate(SamePlot = Plot.ID == lead(Plot.ID)) %>%
+  filter(SamePlot)
+
+# --- 12. Define grazing phases ----
+collars_joined <- collars_joined %>%
+  mutate(
+    Phase_Period = case_when(
+      Time.Mountain >= ymd("2024-07-01") & Time.Mountain <= ymd("2024-08-03") ~ "Phase 1: July 1–Aug 3",
+      Time.Mountain >= ymd("2024-08-04") & Time.Mountain <= ymd("2024-09-03") ~ "Phase 2: Aug 4–Sept 3",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Phase_Period))
+
+# --- 13. Summarize total time per animal × plot × phase ----
+time_per_animal_plot_phase <- collars_joined %>%
+  st_drop_geometry() %>%
+  group_by(Phase_Period, Cow_id, Plot.ID, Treatment) %>%
+  summarise(TotalTime_min = sum(TimeSpent_min, na.rm = TRUE)) %>%
+  ungroup()
+
+# --- 14. Average time per plot (across animals) per phase ----
+avg_time_per_plot_phase <- time_per_animal_plot_phase %>%
+  group_by(Phase_Period, Plot.ID, Treatment) %>%
+  summarise(
+    MeanTime_min = mean(TotalTime_min, na.rm = TRUE),
+    SDTime_min   = sd(TotalTime_min, na.rm = TRUE),
+    n_cows       = n()
+  ) %>%
+  ungroup()
+
+# --- 15. Average time per treatment per phase ----
+avg_time_per_treatment_phase <- avg_time_per_plot_phase %>%
+  group_by(Phase_Period, Treatment) %>%
+  summarise(
+    MeanPlotTime_min = mean(MeanTime_min, na.rm = TRUE),
+    SDPlotTime_min   = sd(MeanTime_min, na.rm = TRUE),
+    n_plots          = n()
+  ) %>%
+  ungroup()
+
+# --- 16. Plot average time per plot (faceted by phase) ----
+ggplot(avg_time_per_plot_phase, aes(x = Plot.ID, y = MeanTime_min, fill = Treatment)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = MeanTime_min - SDTime_min, ymax = MeanTime_min + SDTime_min), width = 0.3) +
+  facet_wrap(~Phase_Period, ncol = 1, scales = "free_x") +
+  labs(
+    title = "Average Time Spent by Cattle per Plot (by Phase)",
+    x = "Plot ID",
+    y = "Mean Time per Plot (minutes)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# --- 17. Plot average time per treatment per phase ----
+ggplot(avg_time_per_treatment_phase, aes(x = Treatment, y = MeanPlotTime_min, fill = Treatment)) +
+  geom_col(width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = MeanPlotTime_min - SDPlotTime_min, ymax = MeanPlotTime_min + SDPlotTime_min),
+                width = 0.2) +
+  facet_wrap(~Phase_Period) +
+  labs(
+    title = "Average Time Spent per Treatment (by Phase)",
+    x = "Treatment",
+    y = "Mean Time (minutes)"
+  ) +
+  theme_minimal()
+
+
+```
+
